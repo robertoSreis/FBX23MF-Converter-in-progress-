@@ -1,3 +1,74 @@
+def build_with_lib3mf(self, vertices, faces, colors, palette, out_3mf):
+        """Constrói 3MF com lib3mf - cores aplicadas durante criação"""
+        import lib3mf as Lib3MF
+        import numpy as np
+        
+        self.log("  Criando modelo 3MF...")
+        wrapper = Lib3MF.Wrapper()
+        model = wrapper.CreateModel()
+        
+        # Criar materiais da paleta
+        self.log("  Criando materiais...")
+        base_materials = model.AddBaseMaterialGroup()
+        
+        palette_int = (palette * 255).astype(np.uint8)
+        for i, color in enumerate(palette_int):
+            base_materials.AddMaterial(
+                f"Color{i}",
+                Lib3MF.sColor(int(color[0]), int(color[1]), int(color[2]), 255)
+            )
+        
+        # Criar mesh object
+        mesh_obj = model.AddMeshObject()
+        mesh_obj.SetName("colored_model")
+        
+        # Adicionar vértices
+        self.log("  Adicionando vértices...")
+        for v in vertices:
+            mesh_obj.AddVertex(Lib3MF.sPosition(float(v[0]), float(v[1]), float(v[2])))
+        
+        # Adicionar triângulos COM CORES simultaneamente
+        self.log("  Adicionando triângulos com cores...")
+        
+        # Verificar se colors são índices (novo método) ou RGB (antigo)
+        if colors.shape == (len(faces), 3) and colors.dtype in [np.int32, np.int64]:
+            # NOVO: índices diretos da paleta
+            self.log("  Modo rápido: índices de paleta")
+            batch_log = 50000
+            for i, (face, color_indices) in enumerate(zip(faces, colors)):
+                if i % batch_log == 0 and i > 0:
+                    self.log(f"    {i}/{len(faces)} ({(i/len(faces)*100):.1f}%)")
+                
+                tri = Lib3MF.sTriangle(int(face[0]), int(face[1]), int(face[2]))
+                mesh_obj.AddTriangle(tri)
+                mesh_obj.SetTriangleProperties(i, base_materials, 
+                    int(color_indices[0]), int(color_indices[1]), int(color_indices[2]))
+        else:
+            # ANTIGO: cores RGB que precisam ser mapeadas
+            self.log("  Modo compatibilidade: mapeando RGB")
+            colors_int = (colors * 255).astype(np.uint8)
+            color_to_idx = {}
+            for i, p_color in enumerate(palette):
+                key = tuple((p_color * 255).astype(np.uint8))
+                color_to_idx[key] = i
+            
+            batch_log = 25000
+            for i, (face, face_colors) in enumerate(zip(faces, colors_int)):
+                if i % batch_log == 0 and i > 0:
+                    self.log(f"    {i}/{len(faces)} ({(i/len(faces)*100):.1f}%)")
+                
+                tri = Lib3MF.sTriangle(int(face[0]), int(face[1]), int(face[2]))
+                mesh_obj.AddTriangle(tri)
+                
+                mat_ids = [color_to_idx.get(tuple(vc), 0) for vc in face_colors]
+                mesh_obj.SetTriangleProperties(i, base_materials, mat_ids[0], mat_ids[1], mat_ids[2])
+        
+        self.log("  Finalizando 3MF...")
+        model.AddBuildItem(mesh_obj, wrapper.GetIdentityTransform())
+        writer = model.QueryWriter("3mf")
+        writer.WriteToFile(out_3mf)
+        self.log("  ✓ 3MF criado com sucesso")
+
 import sys
 import os
 import tempfile
@@ -204,7 +275,7 @@ except Exception as e:
     sys.exit(1)
 """
 
-# ========== Blender script - Conversão DIRETA para 3MF ==========
+# ========== Blender script - Conversão DIRETA E RÁPIDA ==========
 BLENDER_CONVERT_PALETTE_SCRIPT = r'''
 import bpy, sys, json
 import numpy as np
@@ -212,57 +283,26 @@ import numpy as np
 def log(msg):
     print(msg, flush=True)
 
-def find_base_color_image(material):
+def get_material_color(material):
+    """Pega cor do material de forma simples"""
     if not material or not material.use_nodes:
-        return None
-    nodes = material.node_tree.nodes
-    for node in nodes:
-        if node.type == 'BSDF_PRINCIPLED':
-            input = node.inputs.get('Base Color')
-            if input and input.is_linked:
-                for link in input.links:
-                    from_node = link.from_node
-                    if from_node.type == 'TEX_IMAGE':
-                        return getattr(from_node, "image", None)
-    for node in nodes:
-        if node.type == 'TEX_IMAGE':
-            return getattr(node, "image", None)
-    return None
-
-def find_principled_base_color(material):
-    if not material or not material.use_nodes:
-        return None
+        return np.array([0.8, 0.8, 0.8], dtype=np.float32)
+    
     for node in material.node_tree.nodes:
         if node.type == 'BSDF_PRINCIPLED':
-            input = node.inputs.get('Base Color')
-            if input and not input.is_linked:
-                val = input.default_value[:3]
-                return tuple(val)
-    return None
+            base_color = node.inputs.get('Base Color')
+            if base_color and not base_color.is_linked:
+                return np.array(base_color.default_value[:3], dtype=np.float32)
+    
+    return np.array([0.8, 0.8, 0.8], dtype=np.float32)
 
-def sample_texture_fast(img, uvs_array):
-    """Sample textura vetorizado"""
-    if img is None or not img.pixels:
-        return np.full((len(uvs_array), 3), 0.5, dtype=np.float32)
-    
-    width = img.size[0]
-    height = img.size[1]
-    pixels_data = np.array(img.pixels, dtype=np.float32).reshape((height, width, 4))
-    
-    x_coords = np.clip(np.round(uvs_array[:, 0] * (width - 1)), 0, width - 1).astype(np.int32)
-    y_coords = np.clip(np.round(uvs_array[:, 1] * (height - 1)), 0, height - 1).astype(np.int32)
-    
-    return pixels_data[y_coords, x_coords, :3]
-
-def closest_color_indices(colors, palette):
-    """Retorna índices da paleta para cada cor - vetorizado"""
-    colors_exp = colors[:, np.newaxis, :]
-    palette_exp = palette[np.newaxis, :, :]
-    distances = np.sum((colors_exp - palette_exp) ** 2, axis=2)
-    return np.argmin(distances, axis=1)
+def closest_color_idx(color, palette):
+    """Acha índice da cor mais próxima na paleta"""
+    distances = np.sum((palette - color) ** 2, axis=1)
+    return np.argmin(distances)
 
 try:
-    log("=== CONVERSÃO DIRETA FBX → 3MF ===")
+    log("=== CONVERSÃO RÁPIDA FBX → 3MF ===")
     
     palette = {palette_json}
     palette_np = np.array(palette, dtype=np.float32)
@@ -290,118 +330,67 @@ try:
     obj = bpy.context.active_object
     mesh = obj.data
     n_verts = len(mesh.vertices)
-    n_faces = len(mesh.polygons)
-    log(f"Mesh: {{n_verts}} vértices, {{n_faces}} faces")
+    n_polys = len(mesh.polygons)
+    log(f"Mesh: {{n_verts}} vértices, {{n_polys}} polígonos")
     
-    # Analisar materiais
-    log("Mapeando materiais...")
-    uv_layer = mesh.uv_layers.active if mesh.uv_layers else None
+    # ESTRATÉGIA RÁPIDA: Mapear material → cor da paleta
+    log("Mapeando materiais para paleta...")
+    mat_to_palette_idx = {{}}
     
-    mat_info = {{}}
     for i, slot in enumerate(obj.material_slots):
         mat = slot.material
         if mat:
-            img = find_base_color_image(mat)
-            base = find_principled_base_color(mat)
-            if img:
-                mat_info[i] = {{'type': 'texture', 'image': img}}
-                log(f"  Mat {{i}}: texture {{img.name}}")
-            elif base:
-                mat_info[i] = {{'type': 'solid', 'color': np.array(base, dtype=np.float32)}}
-                log(f"  Mat {{i}}: solid {{base}}")
-            else:
-                mat_info[i] = {{'type': 'solid', 'color': np.array([0.8, 0.8, 0.8], dtype=np.float32)}}
+            mat_color = get_material_color(mat)
+            palette_idx = closest_color_idx(mat_color, palette_np)
+            mat_to_palette_idx[i] = palette_idx
+            log(f"  Material {{i}} ({{mat.name}}): Cor {{palette_idx}} - {{'#' + ''.join(f'{{int(c*255):02X}}' for c in palette_np[palette_idx])}}")
         else:
-            mat_info[i] = {{'type': 'solid', 'color': np.array([0.8, 0.8, 0.8], dtype=np.float32)}}
+            mat_to_palette_idx[i] = 0
     
-    # EXTRAIR TODOS OS DADOS DE UMA VEZ
+    # Extrair geometria RAPIDAMENTE
     log("Extraindo geometria...")
     
     vertices = np.zeros((n_verts, 3), dtype=np.float32)
-    for i, v in enumerate(mesh.vertices):
-        vertices[i] = v.co
+    mesh.vertices.foreach_get('co', vertices.ravel())
     
-    # Extrair faces e UVs
-    faces = []
-    face_uvs = []
-    face_mats = []
+    # Extrair faces e suas cores
+    faces_list = []
+    face_colors_list = []  # (n_faces, 3) - índice de paleta para cada vértice
     
+    log("Processando faces...")
     for poly in mesh.polygons:
-        if len(poly.vertices) == 3:
-            faces.append([poly.vertices[0], poly.vertices[1], poly.vertices[2]])
-            face_mats.append(poly.material_index)
-            
-            if uv_layer:
-                uv_data = []
-                for loop_idx in poly.loop_indices:
-                    uv = uv_layer.data[loop_idx].uv
-                    uv_data.append([uv.x, uv.y])
-                face_uvs.append(uv_data)
-            else:
-                face_uvs.append([[0, 0], [0, 0], [0, 0]])
-        elif len(poly.vertices) == 4:
-            # Triangular quad
-            v = poly.vertices
-            faces.append([v[0], v[1], v[2]])
-            faces.append([v[0], v[2], v[3]])
-            face_mats.extend([poly.material_index, poly.material_index])
-            
-            if uv_layer:
-                uvs = [[uv_layer.data[li].uv.x, uv_layer.data[li].uv.y] for li in poly.loop_indices]
-                face_uvs.append([uvs[0], uvs[1], uvs[2]])
-                face_uvs.append([uvs[0], uvs[2], uvs[3]])
-            else:
-                face_uvs.extend([[[0,0],[0,0],[0,0]], [[0,0],[0,0],[0,0]]])
-    
-    faces = np.array(faces, dtype=np.int32)
-    face_uvs = np.array(face_uvs, dtype=np.float32)
-    face_mats = np.array(face_mats, dtype=np.int32)
-    
-    log(f"Total faces (trianguladas): {{len(faces)}}")
-    
-    # CALCULAR CORES POR VÉRTICE DE CADA FACE
-    log("Calculando cores...")
-    vertex_colors = np.zeros((len(faces), 3, 3), dtype=np.float32)  # (n_faces, 3_verts, RGB)
-    
-    batch_size = 10000
-    for batch_start in range(0, len(faces), batch_size):
-        batch_end = min(batch_start + batch_size, len(faces))
-        if batch_start % 50000 == 0:
-            log(f"  {{batch_start}}/{{len(faces)}} faces...")
+        n_verts_poly = len(poly.vertices)
+        mat_idx = poly.material_index
+        palette_idx = mat_to_palette_idx.get(mat_idx, 0)
         
-        for i in range(batch_start, batch_end):
-            mat_idx = face_mats[i]
-            mat = mat_info.get(mat_idx, {{'type': 'solid', 'color': np.array([0.8, 0.8, 0.8])}})
-            
-            if mat['type'] == 'texture':
-                # Sample texture nos 3 UVs
-                uvs = face_uvs[i]
-                colors = sample_texture_fast(mat['image'], uvs)
-                vertex_colors[i] = colors
-            else:
-                # Cor sólida replicada
-                vertex_colors[i] = np.tile(mat['color'], (3, 1))
+        if n_verts_poly == 3:
+            # Triângulo
+            faces_list.append([poly.vertices[0], poly.vertices[1], poly.vertices[2]])
+            face_colors_list.append([palette_idx, palette_idx, palette_idx])
+        elif n_verts_poly == 4:
+            # Quad → 2 triângulos
+            v = poly.vertices
+            faces_list.append([v[0], v[1], v[2]])
+            faces_list.append([v[0], v[2], v[3]])
+            face_colors_list.append([palette_idx, palette_idx, palette_idx])
+            face_colors_list.append([palette_idx, palette_idx, palette_idx])
     
-    # QUANTIZAR PARA PALETA
-    log("Quantizando cores para paleta...")
-    flat_colors = vertex_colors.reshape(-1, 3)
-    palette_indices = closest_color_indices(flat_colors, palette_np)
-    quantized = palette_np[palette_indices].reshape(len(faces), 3, 3)
+    faces = np.array(faces_list, dtype=np.int32)
+    face_palette_indices = np.array(face_colors_list, dtype=np.int32)
     
-    # EXPORTAR 3MF
-    log("Gerando arquivo 3MF...")
-    log("GEOMETRY_READY")
+    log(f"Total faces trianguladas: {{len(faces)}}")
     
-    # Salvar dados para Python processar
+    # Salvar dados
+    log("Salvando dados...")
     np.savez_compressed(
         "{npz_path}",
         vertices=vertices,
         faces=faces,
-        colors=quantized,
+        face_palette_indices=face_palette_indices,
         palette=palette_np
     )
     
-    log("Dados salvos, Python irá gerar 3MF")
+    log("✓ Dados prontos para construção do 3MF")
     sys.exit(0)
     
 except Exception as e:
@@ -493,13 +482,23 @@ class ColorButton(QtWidgets.QPushButton):
     def __init__(self, color, parent=None):
         super().__init__(parent)
         self.color = color
-        self.setFixedSize(60, 60)
+        self.setFixedSize(40, 40)
         self.update_style()
         self.clicked.connect(self.choose_color)
     
     def update_style(self):
         r, g, b = [int(c * 255) for c in self.color[:3]]
-        self.setStyleSheet(f"background-color: rgb({r},{g},{b}); border: 2px solid #333;")
+        # Estilo isolado - não contamina o resto da UI
+        self.setStyleSheet(f"""
+            QPushButton {{
+                background-color: rgb({r},{g},{b}); 
+                border: 2px solid #555;
+                border-radius: 4px;
+            }}
+            QPushButton:hover {{
+                border: 2px solid #000;
+            }}
+        """)
     
     def choose_color(self):
         r, g, b = [int(c * 255) for c in self.color[:3]]
@@ -851,15 +850,24 @@ class ConvertThread(QtCore.QThread):
         data = np.load(npz_path)
         vertices = data['vertices']
         faces = data['faces']
-        colors = data['colors']  # (n_faces, 3, 3) - RGB para cada vértice
         palette = data['palette']
         
-        self.log(f"  {len(vertices)} vértices, {len(faces)} faces")
+        # Detectar formato (novo ou antigo)
+        if 'face_palette_indices' in data:
+            # NOVO: índices diretos (super rápido)
+            colors = data['face_palette_indices']
+            self.log(f"  {len(vertices)} vértices, {len(faces)} faces [modo rápido]")
+        elif 'colors' in data:
+            # ANTIGO: cores RGB
+            colors = data['colors']
+            self.log(f"  {len(vertices)} vértices, {len(faces)} faces [modo compatibilidade]")
+        else:
+            raise RuntimeError("Formato de dados inválido")
         
         if use_lib3mf:
             self.build_with_lib3mf(vertices, faces, colors, palette, out_3mf)
         else:
-            self.build_with_trimesh(vertices, faces, colors, out_3mf)
+            self.build_with_trimesh(vertices, faces, colors, palette, out_3mf)
     
     def build_with_lib3mf(self, vertices, faces, colors, palette, out_3mf):
         """Constrói 3MF com lib3mf - cores aplicadas durante criação"""
@@ -926,20 +934,27 @@ class ConvertThread(QtCore.QThread):
         writer.WriteToFile(out_3mf)
         self.log("  ✓ 3MF criado com sucesso")
     
-    def build_with_trimesh(self, vertices, faces, colors, out_3mf):
+    def build_with_trimesh(self, vertices, faces, colors, palette, out_3mf):
         """Fallback com trimesh (pode perder cores)"""
         import trimesh
         import numpy as np
         
         self.log("  ⚠ Construindo com trimesh - cores podem não funcionar no slicer")
         
-        # Converter cores por face para cores por vértice (aproximação)
+        # Converter cores para vertex colors
         vertex_colors = np.zeros((len(vertices), 4), dtype=np.uint8)
         vertex_colors[:, 3] = 255  # Alpha
         
-        for face_idx, (face, face_colors) in enumerate(zip(faces, colors)):
-            for vert_idx, vert_color in zip(face, face_colors):
-                vertex_colors[vert_idx, :3] = (vert_color * 255).astype(np.uint8)
+        if colors.shape == (len(faces), 3) and colors.dtype in [np.int32, np.int64]:
+            # Índices de paleta
+            for face_idx, (face, color_indices) in enumerate(zip(faces, colors)):
+                for vert_idx, pal_idx in zip(face, color_indices):
+                    vertex_colors[vert_idx, :3] = (palette[pal_idx] * 255).astype(np.uint8)
+        else:
+            # Cores RGB
+            for face_idx, (face, face_colors) in enumerate(zip(faces, colors)):
+                for vert_idx, vert_color in zip(face, face_colors):
+                    vertex_colors[vert_idx, :3] = (vert_color * 255).astype(np.uint8)
         
         mesh = trimesh.Trimesh(vertices=vertices, faces=faces, vertex_colors=vertex_colors)
         mesh.export(out_3mf, file_type='3mf')

@@ -901,150 +901,69 @@ class ConvertThread(QtCore.QThread):
             raise RuntimeError("Formato de dados inválido")
         
         if use_lib3mf:
-            self.build_with_lib3mf(vertices, faces, colors, palette, out_3mf)
+            try:
+                import pymeshlab
+                self.build_with_pymeshlab(vertices, faces, colors, palette, out_3mf)
+            except ImportError:
+                self.log("  ⚠ PyMeshLab não disponível, tentando lib3mf...")
+                self.build_with_lib3mf(vertices, faces, colors, palette, out_3mf)
         else:
             self.build_with_trimesh(vertices, faces, colors, palette, out_3mf)
     
-    def build_with_lib3mf(self, vertices, faces, colors, palette, out_3mf):
-        """Abordagem híbrida: trimesh para geometria + lib3mf para cores"""
-        import lib3mf as Lib3MF
+    def build_with_pymeshlab(self, vertices, faces, colors, palette, out_3mf):
+        """Constrói 3MF com PyMeshLab - suporte completo a cores"""
         import numpy as np
-        import ctypes
-        import trimesh
-        import tempfile
+        import pymeshlab
+        
+        self.log("  === USANDO PYMESHLAB ===")
+        
+        # Criar MeshSet
+        ms = pymeshlab.MeshSet()
+        
+        # Preparar vertex colors
+        self.log("  Preparando cores por vértice...")
+        vertex_colors = np.zeros((len(vertices), 4), dtype=np.uint8)
+        vertex_colors[:, 3] = 255  # Alpha
+        
+        if colors.shape == (len(faces), 3) and colors.dtype in [np.int32, np.int64]:
+            # Índices de paleta
+            self.log("  Modo: índices de paleta")
+            for face, color_indices in zip(faces, colors):
+                for vert_idx, color_idx in zip(face, color_indices):
+                    color_idx = max(0, min(int(color_idx), len(palette) - 1))
+                    vertex_colors[vert_idx, :3] = (palette[color_idx] * 255).astype(np.uint8)
+        else:
+            # Cores RGB
+            self.log("  Modo: cores RGB diretas")
+            colors_normalized = colors.astype(np.float32)
+            if colors_normalized.max() > 1.0:
+                colors_normalized = colors_normalized / 255.0
+            
+            for face, face_colors in zip(faces, colors_normalized):
+                for vert_idx, vert_color in zip(face, face_colors):
+                    vertex_colors[vert_idx, :3] = (vert_color[:3] * 255).astype(np.uint8)
+        
+        self.log(f"  Criando mesh: {len(vertices)} vértices, {len(faces)} faces")
+        
+        # Criar mesh com cores
+        m = pymeshlab.Mesh(
+            vertex_matrix=vertices.astype(np.float64),
+            face_matrix=faces.astype(np.int32),
+            v_color_matrix=vertex_colors.astype(np.float32) / 255.0  # PyMeshLab espera 0-1
+        )
+        
+        ms.add_mesh(m, "colored_mesh")
+        
+        # Salvar como 3MF
+        self.log("  Salvando 3MF...")
+        ms.save_current_mesh(out_3mf)
+        
         import os
-        
-        self.log("  === ABORDAGEM HÍBRIDA: Trimesh + Lib3MF ===")
-        
-        # PASSO 1: Criar mesh básico com trimesh
-        self.log("  [1/4] Criando geometria base com trimesh...")
-        temp_3mf = tempfile.NamedTemporaryFile(suffix='.3mf', delete=False).name
-        
-        try:
-            # Criar mesh simples
-            mesh_trimesh = trimesh.Trimesh(vertices=vertices, faces=faces)
-            mesh_trimesh.export(temp_3mf, file_type='3mf')
-            self.log(f"  ✓ Geometria base criada: {len(vertices)} vértices, {len(faces)} faces")
-            
-            # PASSO 2: Reabrir com lib3mf e adicionar cores
-            self.log("  [2/4] Reabrindo com lib3mf para adicionar cores...")
-            wrapper = Lib3MF.Wrapper()
-            model = wrapper.CreateModel()
-            
-            # Ler o 3mf criado pelo trimesh
-            reader = model.QueryReader("3mf")
-            reader.ReadFromFile(temp_3mf)
-            self.log("  ✓ Arquivo base carregado")
-            
-            # PASSO 3: Criar materiais
-            self.log("  [3/4] Criando paleta de materiais...")
-            base_materials = model.AddBaseMaterialGroup()
-            
-            palette_int = (palette * 255).astype(np.uint8)
-            for i, color in enumerate(palette_int):
-                base_materials.AddMaterial(
-                    f"Color{i}",
-                    Lib3MF.Color(int(color[0]), int(color[1]), int(color[2]), 255)
-                )
-            
-            self.log(f"  ✓ {len(palette)} materiais criados")
-            
-            # PASSO 4: Aplicar cores aos objetos existentes
-            self.log("  [4/4] Aplicando cores aos meshes...")
-            
-            # Preparar mapa de cores
-            if colors.shape == (len(faces), 3) and colors.dtype in [np.int32, np.int64]:
-                face_color_indices = colors[:, 0]  # Usar primeiro vértice de cada face
-            else:
-                # Mapear RGB para índices
-                colors_int = (colors * 255).astype(np.uint8)
-                color_to_idx = {}
-                for i, p_color in enumerate(palette):
-                    key = tuple((p_color * 255).astype(np.uint8))
-                    color_to_idx[key] = i
-                
-                face_color_indices = []
-                for face_colors in colors_int:
-                    idx = color_to_idx.get(tuple(face_colors[0]), 0)
-                    face_color_indices.append(idx)
-                face_color_indices = np.array(face_color_indices)
-            
-            # Agrupar por cor e criar componentes separados
-            from collections import defaultdict
-            faces_by_color = defaultdict(list)
-            
-            for face_idx, color_idx in enumerate(face_color_indices):
-                faces_by_color[int(color_idx)].append(faces[face_idx])
-            
-            self.log(f"  Encontradas {len(faces_by_color)} cores únicas")
-            
-            # Remover objetos antigos e criar novos com cores
-            iterator = model.GetBuildItems()
-            while iterator.MoveNext():
-                item = iterator.GetCurrent()
-                model.RemoveBuildItem(item)
-            
-            # Criar novo mesh para cada cor
-            for color_idx, color_faces in faces_by_color.items():
-                self.log(f"    Cor {color_idx}: {len(color_faces)} faces")
-                
-                # Mapear vértices usados
-                used_verts = set()
-                for face in color_faces:
-                    used_verts.update(face)
-                
-                used_verts = sorted(used_verts)
-                vert_map = {old_idx: new_idx for new_idx, old_idx in enumerate(used_verts)}
-                
-                # Criar mesh
-                mesh_obj = model.AddMeshObject()
-                mesh_obj.SetName(f"part_color_{color_idx}")
-                
-                # Adicionar vértices
-                for old_idx in used_verts:
-                    v = vertices[old_idx]
-                    pos = Lib3MF.Position()
-                    pos.X = float(v[0])
-                    pos.Y = float(v[1])
-                    pos.Z = float(v[2])
-                    mesh_obj.AddVertex(pos)
-                
-                # Adicionar faces
-                for face in color_faces:
-                    tri = Lib3MF.Triangle()
-                    tri.Indices = (ctypes.c_uint32 * 3)(
-                        vert_map[face[0]],
-                        vert_map[face[1]],
-                        vert_map[face[2]]
-                    )
-                    mesh_obj.AddTriangle(tri)
-                
-                # Adicionar ao build SEM propriedades de cor
-                # (cada componente separado já é visualmente distinto)
-                model.AddBuildItem(mesh_obj, wrapper.GetIdentityTransform())
-                
-                self.log(f"    ✓ Componente {color_idx} adicionado ({len(color_faces)} faces)")
-
-            
-            # Salvar arquivo final
-            self.log("  Salvando 3MF final com cores...")
-            writer = model.QueryWriter("3mf")
-            writer.WriteToFile(out_3mf)
-            
-            if os.path.exists(out_3mf):
-                size_mb = os.path.getsize(out_3mf) / (1024 * 1024)
-                self.log(f"  ✓ 3MF criado: {size_mb:.2f} MB, {len(faces_by_color)} componentes coloridos")
-            else:
-                raise RuntimeError("Falha ao criar 3MF final")
-                
-        finally:
-            # Limpar arquivo temporário
-            try:
-                if os.path.exists(temp_3mf):
-                    os.unlink(temp_3mf)
-            except:
-                pass
-    
+        if os.path.exists(out_3mf):
+            size_mb = os.path.getsize(out_3mf) / (1024 * 1024)
+            self.log(f"  ✓ 3MF criado: {size_mb:.2f} MB")
+        else:
+            raise RuntimeError("Falha ao criar 3MF")
     
     def build_with_trimesh(self, vertices, faces, colors, palette, out_3mf):
         """Fallback com trimesh (pode perder cores)"""
